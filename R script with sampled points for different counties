@@ -1,0 +1,221 @@
+library(shiny)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyr)
+
+# Define UI
+ui <- fluidPage(
+  titlePanel("MSNA KENYA 2024 DATA COLLECTION ASALS TRACKING DASHBOARD"),
+  
+  mainPanel(
+    # Output: Display dashboard information
+    textOutput("total_surveys"),
+    dataTableOutput("survey_per_county"),
+    dataTableOutput("less_time_surveys_per_enumerator"),
+    dataTableOutput("cleaning_log_summary"),
+    dataTableOutput("enumerators_per_point"),
+    downloadButton("download_survey_per_county", "Download Survey Per county (CSV)"),
+    downloadButton("download_less_time_surveys_per_enumerator", "Download Less Time Surveys Per Enumerator (CSV)"),
+    downloadButton("download_cleaning_log_summary", "Download Cleaning Log Summary (CSV)"),
+    downloadButton("download_enumerators_per_point", "Download Enumerators Per Point (CSV)"),
+    downloadButton("download_original_data", "Download Original Data (XLSX)")
+  )
+)
+
+# Define server logic
+server <- function(input, output, session) {
+  
+  # Preload example Excel data
+  example_data <- read_excel("Data11.xlsx", sheet = "KEN_MSNA_ASALs_2024")
+  example_data$date <- as.Date(example_data$today)
+  
+  # Filter the data
+  example_data <- example_data %>% filter(today >= as.Date("2024-05-31"))
+  cleaning_log <- read_excel('cleaning_log_2024-06-04.xlsx', sheet = "cleaning_log")
+  
+  # Exclude the data where consensus is "no"
+  example_data <- subset(example_data, consent != "no")
+  
+  # Convert start and end columns to datetime objects
+  example_data$start <- as.POSIXct(example_data$start)
+  example_data$end <- as.POSIXct(example_data$end)
+  
+  # Function to calculate surveys per county, sub_location, and point_number
+  calculate_surveys_per_county <- function(data) {
+    data$absolute_difference <- as.numeric(abs(as.numeric(difftime(data$end, data$start, units = "mins"))))
+    less_time_surveys <- subset(data, absolute_difference < 25)
+    
+    # Calculate surveys per county, sub_location, and point_number
+    survey_summary <- data %>%
+      group_by(county, sub_location, point_number) %>%
+      summarise(Surveys_Collected = n(),
+                Surveys_Deleted = sum(absolute_difference < 25),
+                .groups = 'drop')
+    
+    survey_summary <- survey_summary %>%
+      mutate(Surveys_Remaining = Surveys_Collected - Surveys_Deleted)
+    
+    # Add a total row
+    total_row <- survey_summary %>%
+      summarise(county = "Total", 
+                sub_location = "All", 
+                point_number = "All",
+                Surveys_Collected = sum(Surveys_Collected), 
+                Surveys_Deleted = sum(Surveys_Deleted), 
+                Surveys_Remaining = sum(Surveys_Remaining))
+    
+    survey_summary <- bind_rows(survey_summary, total_row)
+    survey_summary
+  }
+  
+  less_time_surveys_per_enumerator <- reactive({
+    example_data$absolute_difference <- as.numeric(abs(as.numeric(difftime(example_data$end, example_data$start, units = "mins"))))
+    less_time_surveys <- subset(example_data, absolute_difference < 25)
+    
+    # Create a summary for less time surveys
+    less_time_survey_summary <- less_time_surveys %>%
+      group_by(enum_id, county) %>%
+      summarise(Surveys_deleted = n(), .groups = 'drop')
+    
+    # Create a summary for total surveys
+    total_survey_summary <- example_data %>%
+      group_by(enum_id, county) %>%
+      summarise(Surveys_collected = n(), .groups = 'drop')
+    
+    # Merge the two summaries
+    merged_data <- full_join(total_survey_summary, less_time_survey_summary, by = c("enum_id", "county"))
+    
+    # Replace NA values with 0
+    merged_data <- merged_data %>%
+      mutate(Surveys_deleted = ifelse(is.na(Surveys_deleted), 0, Surveys_deleted),
+             Surveys_remaining = Surveys_collected - Surveys_deleted)
+    
+    # Calculate total summaries
+    total_surveys_collected <- sum(merged_data$Surveys_collected, na.rm = TRUE)
+    total_surveys_deleted <- sum(merged_data$Surveys_deleted, na.rm = TRUE)
+    total_surveys_remaining <- sum(merged_data$Surveys_remaining, na.rm = TRUE)
+    
+    # Add a total row
+    total_row <- data.frame(enum_id = "Total", county = "All", Surveys_collected = total_surveys_collected, 
+                            Surveys_deleted = total_surveys_deleted, Surveys_remaining = total_surveys_remaining)
+    
+    merged_data <- bind_rows(merged_data, total_row)
+    
+    merged_data
+  })
+  
+  # Function to summarize cleaning log
+  summarize_cleaning_log <- function(data) {
+    if(!("issue" %in% colnames(data))) {
+      stop("The cleaning log does not contain a column named 'issue'")
+    }
+    
+    data <- data %>% mutate(enumerator_county = paste(enum_id, county, sep = "_"))
+    summary <- table(data$enumerator_county, data$issue)
+    summary_df <- as.data.frame.matrix(summary)
+    summary_df$enumerator_county <- rownames(summary_df)
+    summary_df <- summary_df %>% separate(enumerator_county, into = c("enumerator", "county"), sep = "_")
+    total_row <- colSums(summary_df[, -c(ncol(summary_df)-1, ncol(summary_df)), drop = FALSE])
+    total_row <- c("Total", "All", total_row)
+    summary_df <- rbind(summary_df, total_row)
+    summary_df
+  }
+  
+  # Function to calculate the number of enumerators per point_number
+  calculate_enumerators_per_point <- function(data) {
+    enumerators_per_point <- data %>%
+      group_by(point_number) %>%
+      summarise(Enumerators = n_distinct(enum_id),
+                Surveys_Count = n(),  # Count of surveys for this point_number
+                Enumerators_List = paste(unique(enum_id), collapse = ", "), 
+                .groups = 'drop')
+    
+    # Add a total row
+    total_row <- data.frame(point_number = "Total", 
+                            Enumerators = sum(enumerators_per_point$Enumerators),
+                            Surveys_Count = sum(enumerators_per_point$Surveys_Count),
+                            Enumerators_List = NA)
+    
+    enumerators_per_point <- bind_rows(enumerators_per_point, total_row)
+    enumerators_per_point
+  }
+  
+  # Display total surveys
+  output$total_surveys <- renderText({
+    paste("Total surveys collected:", nrow(example_data))
+  })
+  
+  # Calculate total surveys per county, sub_location, and point_number
+  output$survey_per_county <- renderDataTable({
+    calculate_surveys_per_county(example_data)
+  })
+  
+  # Display less time surveys per enumerator
+  output$less_time_surveys_per_enumerator <- renderDataTable({
+    less_time_surveys_per_enumerator()
+  })
+  
+  # Summarize cleaning log
+  output$cleaning_log_summary <- renderDataTable({
+    summarize_cleaning_log(cleaning_log)
+  })
+  
+  # Display the number of enumerators per point_number
+  output$enumerators_per_point <- renderDataTable({
+    calculate_enumerators_per_point(example_data)
+  })
+  
+  # Download Survey Per Camp button handler
+  output$download_survey_per_county <- downloadHandler(
+    filename = function() {
+      "survey_per_county.csv"
+    },
+    content = function(file) {
+      write.csv(calculate_surveys_per_county(example_data), file, row.names = FALSE)
+    }
+  )
+  
+  # Download Less Time Surveys Per Enumerator button handler
+  output$download_less_time_surveys_per_enumerator <- downloadHandler(
+    filename = function() {
+      "less_time_surveys_per_enumerator.csv"
+    },
+    content = function(file) {
+      write.csv(less_time_surveys_per_enumerator(), file, row.names = FALSE)
+    }
+  )
+  
+  # Download Cleaning Log Summary button handler
+  output$download_cleaning_log_summary <- downloadHandler(
+    filename = function() {
+      "cleaning_log_summary.csv"
+    },
+    content = function(file) {
+      write.csv(summarize_cleaning_log(cleaning_log), file, row.names = FALSE)
+    }
+  )
+  
+  # Download Enumerators Per Point button handler
+  output$download_enumerators_per_point <- downloadHandler(
+    filename = function() {
+      "enumerators_per_point.csv"
+    },
+    content = function(file) {
+      write.csv(calculate_enumerators_per_point(example_data), file, row.names = FALSE)
+    }
+  )
+  
+  # Download Original Data button handler
+  output$download_original_data <- downloadHandler(
+    filename = function() {
+      "original_data.xlsx"
+    },
+    content = function(file) {
+      write_xlsx(example_data, file)
+    }
+  )
+}
+
+# Run the application
+shinyApp(ui = ui, server = server)
